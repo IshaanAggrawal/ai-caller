@@ -1,0 +1,10 @@
+version: "3"
+agent:
+  authtoken: 3AD8nABxIn1Zmiz2CmGhkplKjJx_555MwNwZSfjMi6NAwrdCf
+tunnels:
+  django:
+    proto: http
+    addr: 8000
+  fastapi:
+    proto: http
+    addr: 8001

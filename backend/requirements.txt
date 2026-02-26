@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+websockets
+twilio
+python-dotenv
+requests
+django
+groq
+deepgram-sdk
+cartesia

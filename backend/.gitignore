@@ -1,0 +1,23 @@
+# Environments
+venv/
+env/
+.venv/
+
+# Environment variables
+.env
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Database
+db.sqlite3
+
+# IDE / Editor folders (optional but recommended)
+.vscode/
+.idea/
+
+# OS generated files (optional but recommended)
+.DS_Store
+Thumbs.db
