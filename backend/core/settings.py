@@ -24,23 +24,25 @@ load_dotenv(BASE_DIR / '.env')
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-o+o#eb@7y&@xxseqop0sf2jz--6vhym5y^2vea7c$&0hfk_bts'
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-o+o#eb@7y&@xxseqop0sf2jz--6vhym5y^2vea7c$&0hfk_bts')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'True').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = ['*'] # Allowed all for ngrok development
+ALLOWED_HOSTS = ['*']  # Allows ngrok, Render, and localhost
 
 
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'channels',
     'calls',
 ]
 
@@ -72,6 +74,14 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'core.wsgi.application'
+ASGI_APPLICATION = 'core.asgi.application'
+
+# Allow Twilio webhooks, ngrok, and Render
+CSRF_TRUSTED_ORIGINS = [
+    'https://*.ngrok-free.dev',
+    'https://*.ngrok.io',
+    'https://*.onrender.com',
+]
 
 
 # Database

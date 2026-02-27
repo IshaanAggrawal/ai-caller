@@ -4,46 +4,28 @@
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
 
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
+dist/
+build/
 
-# Django stuff:
+# Django
 *.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+staticfiles/
 
-# FastAPI / Uvicorn
-.mypy_cache/
-.pytest_cache/
+# ngrok
+ngrok.exe
+ngrok.yml
+ngrok.zip
 
 # IDEs
 .vscode/
@@ -51,6 +33,7 @@ db.sqlite3-journal
 *.swp
 *.swo
 
-# ngrok
-ngrok.exe
-ngrok.yml
+# OS
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: ai-voice-caller
+    runtime: python
+    region: singapore  # closest to India
+    rootDir: backend
+    buildCommand: "./build.sh"
+    startCommand: "daphne -b 0.0.0.0 -p $PORT core.asgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: DOMAIN
+        sync: false
+      - key: DJANGO_SETTINGS_MODULE
+        value: core.settings
