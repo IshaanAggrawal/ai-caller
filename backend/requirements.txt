@@ -6,7 +6,7 @@ python-dotenv
 requests
 django
 groq
-deepgram-sdk
+deepgram-sdk<4.0
 elevenlabs
 aiohttp
 certifi
