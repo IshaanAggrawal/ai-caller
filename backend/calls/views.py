@@ -1,11 +1,22 @@
-from django.http import HttpResponse, JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from django.http import HttpResponse
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, generics
+from rest_framework.decorators import api_view
 from twilio.rest import Client
 import os
 import json
 import base64
 import certifi
 from datetime import datetime, timezone
+
+from .models import CallSession, CallEvent
+from .serializers import (
+    CallSessionSerializer,
+    CallSessionListSerializer,
+    MakeCallRequestSerializer,
+    TestChatRequestSerializer
+)
 
 # Fix for broken SSL cert on Windows
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
@@ -16,40 +27,33 @@ os.environ['CURL_CA_BUNDLE'] = certifi.where()
 # Health Check
 # ------------------------------------------------------------------
 
-def health(request):
+class HealthCheckView(APIView):
     """GET /calls/health/ — Service health check."""
-    return JsonResponse({
-        'status': 'ok',
-        'service': 'ai-voice-caller',
-        'timestamp': datetime.now(timezone.utc).isoformat(),
-    })
+    
+    def get(self, request):
+        return Response({
+            'status': 'ok',
+            'service': 'ai-voice-caller',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
 
 
 # ------------------------------------------------------------------
 # Outbound Calls
 # ------------------------------------------------------------------
 
-@csrf_exempt
-def make_call(request):
+class MakeCallView(APIView):
     """
     POST /calls/make-call/ — Initiate an outbound call via Twilio.
-
-    Body:
-    {
-        "to": "+919876543210",
-        "system_prompt": "You are a loan recovery agent...",      (optional)
-        "context_url": "https://your-crm.com/api/customer/123",   (optional)
-        "context_headers": {"Authorization": "Bearer xxx"}         (optional)
-    }
     """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
-
-    try:
-        data = json.loads(request.body)
+    
+    def post(self, request):
+        serializer = MakeCallRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        data = serializer.validated_data
         to_phone_number = data.get('to')
-        if not to_phone_number:
-            return JsonResponse({'error': 'Missing "to" phone number'}, status=400)
 
         account_sid = os.environ['TWILIO_ACCOUNT_SID']
         auth_token = os.environ['TWILIO_AUTH_TOKEN']
@@ -57,247 +61,204 @@ def make_call(request):
         domain = os.environ.get('DOMAIN')
 
         if not domain:
-            return JsonResponse({'error': 'Missing DOMAIN in .env'}, status=500)
+            return Response({'error': 'Missing DOMAIN in .env'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        client = Client(account_sid, auth_token)
+        try:
+            client = Client(account_sid, auth_token)
 
-        call = client.calls.create(
-            url=f"https://{domain}/calls/twiml/",
-            to=to_phone_number,
-            from_=from_phone_number,
-            status_callback=f"https://{domain}/calls/call-status/",
-            status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
-            status_callback_method='POST',
-        )
+            call = client.calls.create(
+                url=f"https://{domain}/calls/twiml/",
+                to=to_phone_number,
+                from_=from_phone_number,
+                status_callback=f"https://{domain}/calls/call-status/",
+                status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+                status_callback_method='POST',
+            )
 
-        # Create CallSession in DB
-        from calls.models import CallSession, CallEvent
-        session = CallSession.objects.create(
-            call_sid=call.sid,
-            from_number=from_phone_number,
-            to_number=to_phone_number,
-            status='initiated',
-            system_prompt=data.get('system_prompt', CallSession._meta.get_field('system_prompt').default),
-            context_url=data.get('context_url'),
-            context_headers=data.get('context_headers'),
-        )
+            # Create CallSession in DB
+            system_prompt = data.get('system_prompt') or CallSession._meta.get_field('system_prompt').default
+            
+            session = CallSession.objects.create(
+                call_sid=call.sid,
+                from_number=from_phone_number,
+                to_number=to_phone_number,
+                status='initiated',
+                system_prompt=system_prompt,
+                context_url=data.get('context_url'),
+                context_headers=data.get('context_headers'),
+            )
 
-        CallEvent.objects.create(
-            session=session,
-            event_type='call_initiated',
-            detail=f"Outbound call to {to_phone_number}, SID={call.sid}"
-        )
+            CallEvent.objects.create(
+                session=session,
+                event_type='call_initiated',
+                detail=f"Outbound call to {to_phone_number}, SID={call.sid}"
+            )
 
-        return JsonResponse({
-            'message': 'Call initiated',
-            'call_sid': call.sid,
-            'session_id': str(session.id),
-        })
+            return Response({
+                'message': 'Call initiated',
+                'call_sid': call.sid,
+                'session_id': str(session.id),
+            }, status=status.HTTP_201_CREATED)
 
-    except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ------------------------------------------------------------------
 # Inbound Calls
 # ------------------------------------------------------------------
 
-@csrf_exempt
-def inbound(request):
+class InboundCallView(APIView):
     """
     POST /calls/inbound/ — Handle incoming calls to the Twilio number.
-
-    Twilio hits this webhook when someone calls your Twilio number.
-    Creates a session and connects the call to the AI via WebSocket.
+    Returns standard HttpResponse because Twilio expects raw XML, not JSON.
     """
-    if request.method != 'POST':
-        return HttpResponse('Only POST method allowed', status=405)
+    
+    def post(self, request):
+        call_sid = request.POST.get('CallSid', '')
+        from_number = request.POST.get('From', 'unknown')
+        to_number = request.POST.get('To', 'unknown')
+        domain = os.environ.get('DOMAIN')
 
-    call_sid = request.POST.get('CallSid', '')
-    from_number = request.POST.get('From', 'unknown')
-    to_number = request.POST.get('To', 'unknown')
-    domain = os.environ.get('DOMAIN')
+        if not domain:
+            return HttpResponse("Missing DOMAIN in environment.", status=500)
 
-    if not domain:
-        return HttpResponse("Missing DOMAIN in environment.", status=500)
-
-    # Create a CallSession for the inbound call
-    from calls.models import CallSession, CallEvent
-    session, created = CallSession.objects.get_or_create(
-        call_sid=call_sid,
-        defaults={
-            'from_number': from_number,
-            'to_number': to_number,
-            'status': 'ringing',
-        }
-    )
-
-    if created:
-        CallEvent.objects.create(
-            session=session,
-            event_type='call_initiated',
-            detail=f"Inbound call from {from_number}, SID={call_sid}"
+        # Create a CallSession for the inbound call
+        session, created = CallSession.objects.get_or_create(
+            call_sid=call_sid,
+            defaults={
+                'from_number': from_number,
+                'to_number': to_number,
+                'status': 'ringing',
+            }
         )
 
-    # Return TwiML to connect to our WebSocket
-    response = f"""<?xml version="1.0" encoding="UTF-8"?>
+        if created:
+            CallEvent.objects.create(
+                session=session,
+                event_type='call_initiated',
+                detail=f"Inbound call from {from_number}, SID={call_sid}"
+            )
+
+        # Return TwiML to connect to our WebSocket
+        response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="wss://{domain}/media-stream" />
     </Connect>
 </Response>"""
-    return HttpResponse(response, content_type='text/xml')
+        return HttpResponse(response, content_type='text/xml')
 
 
 # ------------------------------------------------------------------
 # TwiML (for outbound calls)
 # ------------------------------------------------------------------
 
-@csrf_exempt
-def twiml(request):
+class TwiMLView(APIView):
     """
     POST /calls/twiml/ — Twilio requests this when the callee answers an outbound call.
     Returns TwiML to connect the call to our Django Channels WebSocket.
     """
-    if request.method != 'POST':
-        return HttpResponse('Only POST method allowed', status=405)
+    
+    def post(self, request):
+        domain = os.environ.get('DOMAIN')
+        if not domain:
+            return HttpResponse("Missing DOMAIN in environment.", status=500)
 
-    domain = os.environ.get('DOMAIN')
-    if not domain:
-        return HttpResponse("Missing DOMAIN in environment.", status=500)
-
-    response = f"""<?xml version="1.0" encoding="UTF-8"?>
+        response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="wss://{domain}/media-stream" />
     </Connect>
 </Response>"""
-    return HttpResponse(response, content_type='text/xml')
+        return HttpResponse(response, content_type='text/xml')
 
 
 # ------------------------------------------------------------------
 # Call Status Webhook
 # ------------------------------------------------------------------
 
-@csrf_exempt
-def call_status(request):
+class CallStatusView(APIView):
     """
     POST /calls/call-status/ — Twilio sends real-time call status updates here.
-
-    Tracks: initiated → ringing → in-progress → completed/failed/no-answer
     """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
+    
+    def post(self, request):
+        call_sid = request.POST.get('CallSid', '')
+        call_status_value = request.POST.get('CallStatus', '')
+        duration = request.POST.get('CallDuration')
 
-    call_sid = request.POST.get('CallSid', '')
-    call_status_value = request.POST.get('CallStatus', '')
-    duration = request.POST.get('CallDuration')
+        # Map Twilio status to our model status
+        status_map = {
+            'initiated': 'initiated',
+            'ringing': 'ringing',
+            'in-progress': 'in_progress',
+            'completed': 'completed',
+            'failed': 'failed',
+            'busy': 'failed',
+            'no-answer': 'no_answer',
+            'canceled': 'failed',
+        }
 
-    # Map Twilio status to our model status
-    status_map = {
-        'initiated': 'initiated',
-        'ringing': 'ringing',
-        'in-progress': 'in_progress',
-        'completed': 'completed',
-        'failed': 'failed',
-        'busy': 'failed',
-        'no-answer': 'no_answer',
-        'canceled': 'failed',
-    }
+        mapped_status = status_map.get(call_status_value, call_status_value)
 
-    mapped_status = status_map.get(call_status_value, call_status_value)
+        try:
+            session = CallSession.objects.get(call_sid=call_sid)
+            session.status = mapped_status
 
-    from calls.models import CallSession, CallEvent
-    try:
-        session = CallSession.objects.get(call_sid=call_sid)
-        session.status = mapped_status
+            if call_status_value in ('completed', 'failed', 'busy', 'no-answer', 'canceled'):
+                session.ended_at = datetime.now(timezone.utc)
+                if duration:
+                    session.duration_seconds = int(duration)
 
-        if call_status_value in ('completed', 'failed', 'busy', 'no-answer', 'canceled'):
-            session.ended_at = datetime.now(timezone.utc)
-            if duration:
-                session.duration_seconds = int(duration)
+            session.save()
 
-        session.save()
+            CallEvent.objects.create(
+                session=session,
+                event_type='call_ended' if mapped_status in ('completed', 'failed', 'no_answer') else 'call_started',
+                detail=f"Twilio status: {call_status_value}"
+            )
 
-        CallEvent.objects.create(
-            session=session,
-            event_type='call_ended' if mapped_status in ('completed', 'failed', 'no_answer') else 'call_started',
-            detail=f"Twilio status: {call_status_value}"
-        )
+        except CallSession.DoesNotExist:
+            pass  # Call might not have been tracked
 
-    except CallSession.DoesNotExist:
-        pass  # Call might not have been tracked
-
-    return JsonResponse({'status': 'received'})
+        return Response({'status': 'received'})
 
 
 # ------------------------------------------------------------------
 # Call History & Detail APIs
 # ------------------------------------------------------------------
 
-def call_history(request):
+class CallHistoryView(generics.ListAPIView):
     """GET /calls/call-history/ — Paginated list of past calls."""
-    if request.method != 'GET':
-        return JsonResponse({'error': 'Only GET method allowed'}, status=405)
-
-    from calls.models import CallSession
-    page = int(request.GET.get('page', 1))
-    per_page = int(request.GET.get('per_page', 20))
-    offset = (page - 1) * per_page
-
-    sessions = CallSession.objects.all()[offset:offset + per_page]
-    total = CallSession.objects.count()
-
-    data = []
-    for s in sessions:
-        data.append({
-            'session_id': str(s.id),
-            'call_sid': s.call_sid,
-            'from_number': s.from_number,
-            'to_number': s.to_number,
-            'status': s.status,
-            'started_at': s.started_at.isoformat() if s.started_at else None,
-            'ended_at': s.ended_at.isoformat() if s.ended_at else None,
-            'duration_seconds': s.duration_seconds,
+    queryset = CallSession.objects.all().order_by('-started_at')
+    serializer_class = CallSessionListSerializer
+    
+    # Custom pagination logic to mimic previous response structure
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        
+        page = int(request.query_params.get('page', 1))
+        per_page = int(request.query_params.get('per_page', 20))
+        offset = (page - 1) * per_page
+        
+        paginated_queryset = queryset[offset:offset + per_page]
+        total = queryset.count()
+        
+        serializer = self.get_serializer(paginated_queryset, many=True)
+        return Response({
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+            'results': serializer.data,
         })
 
-    return JsonResponse({
-        'total': total,
-        'page': page,
-        'per_page': per_page,
-        'results': data,
-    })
 
-
-def call_detail(request, call_sid):
+class CallDetailView(generics.RetrieveAPIView):
     """GET /calls/call-detail/<call_sid>/ — Full transcript and events for a call."""
-    if request.method != 'GET':
-        return JsonResponse({'error': 'Only GET method allowed'}, status=405)
-
-    from calls.models import CallSession
-    try:
-        session = CallSession.objects.get(call_sid=call_sid)
-    except CallSession.DoesNotExist:
-        return JsonResponse({'error': 'Call not found'}, status=404)
-
-    messages = list(session.messages.values('role', 'content', 'timestamp'))
-    events = list(session.events.values('event_type', 'detail', 'timestamp'))
-
-    return JsonResponse({
-        'session_id': str(session.id),
-        'call_sid': session.call_sid,
-        'from_number': session.from_number,
-        'to_number': session.to_number,
-        'status': session.status,
-        'started_at': session.started_at.isoformat() if session.started_at else None,
-        'ended_at': session.ended_at.isoformat() if session.ended_at else None,
-        'duration_seconds': session.duration_seconds,
-        'system_prompt': session.system_prompt,
-        'context_url': session.context_url,
-        'context_data': session.context_data,
-        'messages': messages,
-        'events': events,
-    })
+    queryset = CallSession.objects.all()
+    serializer_class = CallSessionSerializer
+    lookup_field = 'call_sid'
 
 
 # ------------------------------------------------------------------
@@ -308,129 +269,119 @@ def call_detail(request, call_sid):
 _test_conversations = {}
 
 
-@csrf_exempt
-def test_chat(request):
+class TestChatView(APIView):
     """
     POST /calls/test-chat/ — Test the LLM without Twilio.
-    Send text, get AI text response. Tests Groq connection and conversation memory.
-
-    Body: {"message": "Hello!", "session_id": "test1", "system_prompt": "..."}
     """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'POST only'}, status=405)
+    
+    def post(self, request):
+        serializer = TestChatRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        data = serializer.validated_data
+        from groq import Groq
 
-    from groq import Groq
+        message = data.get('message')
+        session_id = data.get('session_id')
+        system_prompt = data.get('system_prompt') or 'You are a helpful, brief, and friendly AI phone assistant. Always speak conversationally.'
 
-    data = json.loads(request.body)
-    message = data.get('message', '')
-    session_id = data.get('session_id', 'default')
-    system_prompt = data.get('system_prompt',
-        'You are a helpful, brief, and friendly AI phone assistant. Always speak conversationally.')
+        # Get or create conversation
+        if session_id not in _test_conversations:
+            _test_conversations[session_id] = [{"role": "system", "content": system_prompt}]
 
-    if not message:
-        return JsonResponse({'error': 'Missing "message"'}, status=400)
+        messages = _test_conversations[session_id]
+        messages.append({"role": "user", "content": message})
 
-    # Get or create conversation
-    if session_id not in _test_conversations:
-        _test_conversations[session_id] = [{"role": "system", "content": system_prompt}]
+        try:
+            client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.6,
+                max_tokens=150,
+            )
+            ai_response = completion.choices[0].message.content
+            messages.append({"role": "assistant", "content": ai_response})
 
-    messages = _test_conversations[session_id]
-    messages.append({"role": "user", "content": message})
-
-    try:
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.6,
-            max_tokens=150,
-        )
-        ai_response = completion.choices[0].message.content
-        messages.append({"role": "assistant", "content": ai_response})
-
-        return JsonResponse({
-            'response': ai_response,
-            'session_id': session_id,
-            'turn': len([m for m in messages if m['role'] == 'user']),
-        })
-    except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500)
+            return Response({
+                'response': ai_response,
+                'session_id': session_id,
+                'turn': len([m for m in messages if m['role'] == 'user']),
+            })
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-@csrf_exempt
-def test_voice(request):
+class TestVoiceView(APIView):
     """
     POST /calls/test-voice/ — Test the full pipeline: text → LLM → ElevenLabs audio.
-    Returns AI text response + base64 audio you can play in browser.
-
-    Body: {"message": "Hello!", "session_id": "test1"}
     """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'POST only'}, status=405)
+    
+    def post(self, request):
+        serializer = TestChatRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        data = serializer.validated_data
+        from groq import Groq
+        from elevenlabs import ElevenLabs
 
-    from groq import Groq
-    from elevenlabs import ElevenLabs
+        message = data.get('message')
+        session_id = data.get('session_id')
+        system_prompt = data.get('system_prompt') or 'You are a helpful, brief, and friendly AI phone assistant. Always speak conversationally.'
 
-    data = json.loads(request.body)
-    message = data.get('message', '')
-    session_id = data.get('session_id', 'default')
-    system_prompt = data.get('system_prompt',
-        'You are a helpful, brief, and friendly AI phone assistant. Always speak conversationally.')
+        # Conversation memory
+        if session_id not in _test_conversations:
+            _test_conversations[session_id] = [{"role": "system", "content": system_prompt}]
 
-    if not message:
-        return JsonResponse({'error': 'Missing "message"'}, status=400)
+        messages = _test_conversations[session_id]
+        messages.append({"role": "user", "content": message})
 
-    # Conversation memory
-    if session_id not in _test_conversations:
-        _test_conversations[session_id] = [{"role": "system", "content": system_prompt}]
+        # Step 1: Groq LLM
+        try:
+            groq = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+            completion = groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.6,
+                max_tokens=150,
+            )
+            ai_response = completion.choices[0].message.content
+            messages.append({"role": "assistant", "content": ai_response})
+        except Exception as e:
+            return Response({'error': f'Groq error: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    messages = _test_conversations[session_id]
-    messages.append({"role": "user", "content": message})
+        # Step 2: ElevenLabs TTS
+        audio_b64 = None
+        try:
+            el_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY", ""))
+            voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+            model_id = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2")
 
-    # Step 1: Groq LLM
-    try:
-        groq = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
-        completion = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.6,
-            max_tokens=150,
-        )
-        ai_response = completion.choices[0].message.content
-        messages.append({"role": "assistant", "content": ai_response})
-    except Exception as e:
-        return JsonResponse({'error': f'Groq error: {e}'}, status=500)
+            audio_gen = el_client.text_to_speech.convert(
+                voice_id=voice_id,
+                text=ai_response,
+                model_id=model_id,
+                output_format="mp3_44100_128",  # mp3 for browser playback
+            )
+            audio_bytes = b"".join(audio_gen)
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+        except Exception as e:
+            # Return text even if TTS fails
+            return Response({
+                'response': ai_response,
+                'audio': None,
+                'tts_error': str(e),
+                'session_id': session_id,
+            })
 
-    # Step 2: ElevenLabs TTS
-    audio_b64 = None
-    try:
-        el_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY", ""))
-        voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-        model_id = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2")
-
-        audio_gen = el_client.text_to_speech.convert(
-            voice_id=voice_id,
-            text=ai_response,
-            model_id=model_id,
-            output_format="mp3_44100_128",  # mp3 for browser playback
-        )
-        audio_bytes = b"".join(audio_gen)
-        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-    except Exception as e:
-        # Return text even if TTS fails
-        return JsonResponse({
+        return Response({
             'response': ai_response,
-            'audio': None,
-            'tts_error': str(e),
+            'audio': audio_b64,
+            'audio_format': 'mp3',
             'session_id': session_id,
         })
-
-    return JsonResponse({
-        'response': ai_response,
-        'audio': audio_b64,
-        'audio_format': 'mp3',
-        'session_id': session_id,
-    })
 
 
 def test_page(request):

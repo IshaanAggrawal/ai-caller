@@ -1,301 +1,182 @@
-"""
-Automated Test Suite for AI Voice Caller
-Tests all endpoints: health, chat, voice, history, inbound, call-status
-"""
-
-import urllib.request
+from rest_framework.test import APITestCase
+from rest_framework import status
+from django.urls import reverse
+from calls.models import CallSession, CallEvent
 import json
-import time
-import sys
-
-BASE_URL = "http://localhost:8000"
-PASSED = 0
-FAILED = 0
-RESULTS = []
-
-
-def test(name, fn):
-    global PASSED, FAILED
-    try:
-        result = fn()
-        PASSED += 1
-        RESULTS.append(f"  ✅ {name}")
-        return result
-    except Exception as e:
-        FAILED += 1
-        RESULTS.append(f"  ❌ {name} — {e}")
-        return None
-
-
-def get(path):
-    r = urllib.request.urlopen(f"{BASE_URL}{path}")
-    return json.loads(r.read().decode())
-
-
-def post(path, data, content_type="application/json"):
-    if content_type == "application/json":
-        body = json.dumps(data).encode()
-    else:
-        body = data.encode() if isinstance(data, str) else data
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=body,
-        headers={"Content-Type": content_type},
-        method="POST",
-    )
-    r = urllib.request.urlopen(req)
-    return json.loads(r.read().decode())
-
-
-def post_expect_error(path, data, expected_status, content_type="application/json"):
-    if content_type == "application/json":
-        body = json.dumps(data).encode()
-    else:
-        body = data.encode() if isinstance(data, str) else data
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=body,
-        headers={"Content-Type": content_type},
-        method="POST",
-    )
-    try:
-        r = urllib.request.urlopen(req)
-        return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == expected_status:
-            return json.loads(e.read().decode())
-        raise
-
-
-def get_expect_error(path, expected_status):
-    try:
-        r = urllib.request.urlopen(f"{BASE_URL}{path}")
-        return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == expected_status:
-            return json.loads(e.read().decode())
-        raise
-
-
-print("=" * 60)
-print("  AI Voice Caller — Automated Test Suite")
-print("=" * 60)
-print()
-
-# ---------------------------------------------------------------
-# 1. Health Check
-# ---------------------------------------------------------------
-print("1. Health Check")
-
-
-def t1():
-    r = get("/calls/health/")
-    assert r["status"] == "ok", f"Expected 'ok', got '{r['status']}'"
-    assert r["service"] == "ai-voice-caller"
-    print(f"     Response: {r}")
-
-
-test("GET /calls/health/ returns ok", t1)
-print()
-
-# ---------------------------------------------------------------
-# 2. Call History (empty)
-# ---------------------------------------------------------------
-print("2. Call History (should have existing test data)")
-
-
-def t2():
-    r = get("/calls/call-history/")
-    assert "total" in r, "Missing 'total' field"
-    assert "results" in r, "Missing 'results' field"
-    assert isinstance(r["results"], list), "results should be a list"
-    print(f"     Total calls: {r['total']}")
-
-
-test("GET /calls/call-history/ returns list", t2)
-print()
-
-# ---------------------------------------------------------------
-# 3. Call Detail (404 for unknown)
-# ---------------------------------------------------------------
-print("3. Call Detail (non-existent)")
-
-
-def t3():
-    r = get_expect_error("/calls/call-detail/CA_DOES_NOT_EXIST/", 404)
-    assert r["error"] == "Call not found"
-    print(f"     Response: {r}")
-
-
-test("GET /calls/call-detail/<unknown> returns 404", t3)
-print()
-
-# ---------------------------------------------------------------
-# 4. Inbound Call Webhook
-# ---------------------------------------------------------------
-print("4. Inbound Call Webhook (simulated Twilio POST)")
-
-
-def t4():
-    r = urllib.request.Request(
-        f"{BASE_URL}/calls/inbound/",
-        data="CallSid=CAautotest123&From=%2B919999999999&To=%2B16812816509".encode(),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    resp = urllib.request.urlopen(r)
-    body = resp.read().decode()
-    assert "<Stream" in body, "TwiML should contain <Stream> element"
-    assert "wss://" in body, "TwiML should contain wss:// WebSocket URL"
-    assert "/media-stream" in body, "TwiML should point to /media-stream"
-    print(f"     TwiML: {body.strip()[:120]}...")
-
-
-test("POST /calls/inbound/ returns valid TwiML", t4)
-print()
-
-# ---------------------------------------------------------------
-# 5. Call Status Webhook
-# ---------------------------------------------------------------
-print("5. Call Status Webhook (simulated Twilio status update)")
-
-
-def t5():
-    r = post(
-        "/calls/call-status/",
-        "CallSid=CAautotest123&CallStatus=in-progress&CallDuration=0",
-        content_type="application/x-www-form-urlencoded",
-    )
-    assert r["status"] == "received"
-    print(f"     Response: {r}")
-
-
-test("POST /calls/call-status/ processes status update", t5)
-print()
-
-# ---------------------------------------------------------------
-# 6. Verify inbound call was saved to DB
-# ---------------------------------------------------------------
-print("6. Verify DB — inbound call saved")
-
-
-def t6():
-    r = get("/calls/call-detail/CAautotest123/")
-    assert r["call_sid"] == "CAautotest123"
-    assert r["from_number"] == "+919999999999"
-    assert r["status"] == "in_progress"  # updated by call-status webhook
-    print(f"     Session: {r['session_id']}, Status: {r['status']}")
-
-
-test("GET /calls/call-detail/ shows saved inbound call", t6)
-print()
-
-# ---------------------------------------------------------------
-# 7. Test Chat (Groq LLM)
-# ---------------------------------------------------------------
-print("7. Test Chat — Groq LLM (llama-3.1-8b-instant)")
-
-t7_start = time.time()
-
-
-def t7():
-    r = post("/calls/test-chat/", {"message": "Hello, what is 2+2?", "session_id": "autotest"})
-    assert "response" in r, "Missing 'response' field"
-    assert len(r["response"]) > 0, "Response is empty"
-    latency = int((time.time() - t7_start) * 1000)
-    print(f"     AI: {r['response'][:80]}...")
-    print(f"     Latency: {latency}ms")
-    return r
-
-
-test("POST /calls/test-chat/ gets LLM response", t7)
-print()
-
-# ---------------------------------------------------------------
-# 8. Test Chat — Conversation Memory
-# ---------------------------------------------------------------
-print("8. Test Chat — Conversation Memory")
-
-
-def t8():
-    r = post(
-        "/calls/test-chat/",
-        {"message": "What number did I just ask about?", "session_id": "autotest"},
-    )
-    assert "response" in r
-    assert r["turn"] == 2, f"Expected turn 2, got {r.get('turn')}"
-    print(f"     AI: {r['response'][:80]}...")
-    print(f"     Turn: {r['turn']} (conversation memory working)")
-
-
-test("POST /calls/test-chat/ remembers context", t8)
-print()
-
-# ---------------------------------------------------------------
-# 9. Test Voice (Groq + ElevenLabs)
-# ---------------------------------------------------------------
-print("9. Test Voice — Groq LLM + ElevenLabs TTS")
-
-t9_start = time.time()
-
-
-def t9():
-    r = post(
-        "/calls/test-voice/",
-        {"message": "Say hi in one word", "session_id": "autotest-voice"},
-    )
-    assert "response" in r, "Missing 'response' field"
-    latency = int((time.time() - t9_start) * 1000)
-    print(f"     AI: {r['response'][:80]}...")
-    print(f"     Latency: {latency}ms")
-
-    if r.get("audio"):
-        audio_size = len(r["audio"])
-        print(f"     Audio: {audio_size} chars base64 (~{audio_size * 3 // 4 // 1024}KB mp3)")
-        return r
-    elif r.get("tts_error"):
-        print(f"     ⚠️  TTS Error: {r['tts_error']}")
-        print(f"     (LLM works, but ElevenLabs failed — check API key/quota)")
-        return r
-    else:
-        raise Exception("No audio and no error — unexpected")
-
-
-test("POST /calls/test-voice/ returns text + audio", t9)
-print()
-
-# ---------------------------------------------------------------
-# 10. Test Page HTML
-# ---------------------------------------------------------------
-print("10. Test Page HTML")
-
-
-def t10():
-    r = urllib.request.urlopen(f"{BASE_URL}/calls/test/")
-    html = r.read().decode()
-    assert "AI Voice Caller" in html, "Page title missing"
-    assert "sendMessage" in html, "JavaScript missing"
-    assert "test-voice" in html, "Voice endpoint reference missing"
-    print(f"     HTML size: {len(html)} bytes")
-
-
-test("GET /calls/test/ returns working HTML page", t10)
-print()
-
-# ---------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------
-print("=" * 60)
-print(f"  Results: {PASSED} passed, {FAILED} failed out of {PASSED + FAILED}")
-print("=" * 60)
-print()
-for r in RESULTS:
-    print(r)
-print()
-
-if FAILED > 0:
-    print("⚠️  Some tests failed. Check the errors above.")
-    sys.exit(1)
-else:
-    print("🎉 All tests passed!")
-    sys.exit(0)
+from unittest.mock import patch, MagicMock
+
+class CallEndpointsTests(APITestCase):
+
+    def setUp(self):
+        # Create some initial test data
+        self.session = CallSession.objects.create(
+            call_sid="CAautotest123",
+            from_number="+919999999999",
+            to_number="+16812816509",
+            status="initiated"
+        )
+        CallEvent.objects.create(
+            session=self.session,
+            event_type="call_initiated",
+            detail="Test setup call initiated"
+        )
+
+    def test_1_health_check(self):
+        """GET /calls/health/ returns ok"""
+        response = self.client.get(reverse('health'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'ok')
+        self.assertEqual(response.data['service'], 'ai-voice-caller')
+
+    def test_2_call_history(self):
+        """GET /calls/call-history/ returns list"""
+        response = self.client.get(reverse('call_history'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('total', response.data)
+        self.assertIn('results', response.data)
+        self.assertIsInstance(response.data['results'], list)
+        self.assertGreaterEqual(response.data['total'], 1)
+
+    def test_3_call_detail_404(self):
+        """GET /calls/call-detail/<unknown> returns 404"""
+        response = self.client.get(reverse('call_detail', args=['CA_DOES_NOT_EXIST']))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_4_inbound_webhook(self):
+        """POST /calls/inbound/ returns valid TwiML"""
+        data = {
+            "CallSid": "CA_NEW_INBOUND",
+            "From": "+1234567890",
+            "To": "+0987654321"
+        }
+        # Inbound payload is www-form-urlencoded
+        response = self.client.post(reverse('inbound'), data, format='multipart')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'text/xml')
+        
+        # Verify body contains <Connect> and <Stream> for wss
+        content = response.content.decode()
+        self.assertIn('<Stream', content)
+        self.assertIn('wss://', content)
+        self.assertIn('/media-stream', content)
+
+    def test_5_call_status_webhook(self):
+        """POST /calls/call-status/ processes status update"""
+        data = {
+            "CallSid": "CAautotest123",
+            "CallStatus": "in-progress",
+            "CallDuration": "0"
+        }
+        response = self.client.post(reverse('call_status'), data, format='multipart')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'received')
+
+        # Verify DB updated
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, "in_progress")
+
+    def test_6_saved_inbound_call(self):
+        """GET /calls/call-detail/ shows saved inbound call"""
+        response = self.client.get(reverse('call_detail', args=['CAautotest123']))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['call_sid'], 'CAautotest123')
+        self.assertEqual(response.data['from_number'], '+919999999999')
+
+    @patch('groq.Groq')
+    def test_7_test_chat_llm(self, mock_groq_class):
+        """POST /calls/test-chat/ gets LLM response (MOCKED)"""
+        # Mock the Groq client
+        mock_client = MagicMock()
+        mock_groq_class.return_value = mock_client
+        mock_completion = MagicMock()
+        mock_completion.choices = [MagicMock()]
+        mock_completion.choices[0].message.content = "This is a mock AI response."
+        mock_client.chat.completions.create.return_value = mock_completion
+        
+        data = {
+            "message": "Hello, what is 2+2?",
+            "session_id": "autotest",
+            "system_prompt": "You are a test bot."
+        }
+        response = self.client.post(reverse('test_chat'), data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['response'], "This is a mock AI response.")
+        self.assertEqual(response.data['turn'], 1)
+        mock_client.chat.completions.create.assert_called_once()
+
+    def test_8_test_page_html(self):
+        """GET /calls/test/ returns working HTML page"""
+        response = self.client.get(reverse('test_page'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        content = response.content.decode()
+        self.assertIn('AI Voice Caller', content)
+        self.assertIn('test-voice', content)
+
+    @patch('calls.views.Client')
+    def test_9_make_call_outbound(self, mock_twilio_client_class):
+        """POST /calls/make-call/ simulates outbound call (MOCKED)"""
+        # Mock Twilio Client
+        mock_client = MagicMock()
+        mock_twilio_client_class.return_value = mock_client
+        mock_call = MagicMock()
+        mock_call.sid = "CA_MOCK_OUTBOUND_123"
+        mock_client.calls.create.return_value = mock_call
+        
+        data = {
+            "to": "+19998887777",
+            "system_prompt": "Test prompt"
+        }
+        
+        with patch.dict('os.environ', {
+            'TWILIO_ACCOUNT_SID': 'AC_fake',
+            'TWILIO_AUTH_TOKEN': 'fake_token',
+            'TWILIO_PHONE_NUMBER': '+10000000000',
+            'DOMAIN': 'test.com'
+        }):
+            response = self.client.post(reverse('make_call'), data, format='json')
+            
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['call_sid'], "CA_MOCK_OUTBOUND_123")
+        self.assertEqual(response.data['message'], "Call initiated")
+        
+        # Verify Twilio client was called with right args
+        mock_client.calls.create.assert_called_once()
+        call_kwargs = mock_client.calls.create.call_args[1]
+        self.assertEqual(call_kwargs['to'], "+19998887777")
+        self.assertEqual(call_kwargs['url'], "https://test.com/calls/twiml/")
+
+    @patch('groq.Groq')
+    @patch('elevenlabs.ElevenLabs')
+    def test_10_test_voice_llm_and_tts(self, mock_elevenlabs_class, mock_groq_class):
+        """POST /calls/test-voice/ gets LLM and TTS response (MOCKED)"""
+        # Mock Groq
+        mock_groq_client = MagicMock()
+        mock_groq_class.return_value = mock_groq_client
+        mock_completion = MagicMock()
+        mock_completion.choices = [MagicMock()]
+        mock_completion.choices[0].message.content = "Mock voice response."
+        mock_groq_client.chat.completions.create.return_value = mock_completion
+        
+        # Mock ElevenLabs
+        mock_el_client = MagicMock()
+        mock_elevenlabs_class.return_value = mock_el_client
+        # simulate returning an iterable of bytes
+        mock_el_client.text_to_speech.convert.return_value = [b"mock", b"audio", b"data"]
+        
+        data = {
+            "message": "Speak to me",
+            "session_id": "voice_test"
+        }
+        
+        response = self.client.post(reverse('test_voice'), data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['response'], "Mock voice response.")
+        self.assertEqual(response.data['audio_format'], "mp3")
+        # Base64 of "mockaudiodata" is bW9ja2F1ZGlvZGF0YQ==
+        self.assertEqual(response.data['audio'], "bW9ja2F1ZGlvZGF0YQ==")
+        self.assertEqual(response.data['session_id'], "voice_test")
+        
+        mock_groq_client.chat.completions.create.assert_called_once()
+        mock_el_client.text_to_speech.convert.assert_called_once()
