@@ -8,6 +8,8 @@ Features:
 - ElevenLabs TTS with fallback to Twilio <Say> if ElevenLabs fails
 - External context API integration
 - Full conversation logging to DB
+- **Low latency**: Groq streaming → ElevenLabs
+- **Interruption handling**: AI stops speaking instantly if user interrupts
 """
 
 import os
@@ -20,20 +22,20 @@ from datetime import timezone, datetime
 from channels.generic.websocket import AsyncWebsocketConsumer
 from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 from groq import AsyncGroq
-from elevenlabs import ElevenLabs
+from elevenlabs.client import AsyncElevenLabs
 from asgiref.sync import sync_to_async
 
 # SDK Clients — initialised once at module level
 deepgram = DeepgramClient(os.environ.get("DEEPGRAM_API_KEY", ""))
 groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY", ""))
+el_client = AsyncElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY", ""))
 
 # ElevenLabs config
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # "Rachel" — natural female voice
-ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2")
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5") # Upgraded to 2.5 for lower latency
 
 # Default system prompt (overridden per-call via CallSession)
-DEFAULT_SYSTEM_PROMPT = "You are a helpful, brief, and friendly AI phone assistant. Always speak conversationally."
+DEFAULT_SYSTEM_PROMPT = "You are a helpful, brief, and friendly AI phone assistant. Always speak conversationally. Keep your answers short. NEVER use emojis, markdown formatting, or asterisks like *laughs*."
 
 # End-call phrases — when user says these the AI says goodbye and ends
 END_CALL_PATTERN = re.compile(
@@ -42,7 +44,7 @@ END_CALL_PATTERN = re.compile(
 )
 
 # Low confidence phrases to re-prompt
-LOW_CONFIDENCE_THRESHOLD = 0.6
+LOW_CONFIDENCE_THRESHOLD = 0.5
 
 
 class TwilioMediaConsumer(AsyncWebsocketConsumer):
@@ -58,10 +60,22 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
         self.messages = []
         self.call_active = True
         self.dg_connection = None
+        
+        # State tracking for interruptions and latency
+        self.response_task = None
+        self.interrupted = False
+        self.is_ai_speaking = False
+        self.ai_spoken_buffer = "" # Tracks what AI is currently saying to prevent Echo Hallucinations
+        
+        # Transcription Debounce Buffer
+        self.transcription_buffer = []
+        self.llm_debounce_task = None
 
     async def disconnect(self, close_code):
         print(f"WebSocket disconnected (code={close_code}).")
         self.call_active = False
+        self._cancel_response_task()
+        
         if self.dg_connection:
             try:
                 await self.dg_connection.finish()
@@ -87,7 +101,10 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
             await self._handle_stop()
         elif event == 'mark':
             # Twilio sends 'mark' events when audio playback completes
-            pass
+            if data['mark']['name'] == 'ai_finished_speaking':
+                # Only clear the flag if we haven't already started a new response
+                if not self.response_task or self.response_task.done():
+                    self.is_ai_speaking = False
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -120,9 +137,16 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
 
         # Greet the caller
         greeting = "Hello! How can I help you today?"
-        await self._speak_text(greeting)
-        await self._save_message('assistant', greeting)
-        await self._log_event('ai_response', greeting)
+        asyncio.create_task(self._save_message('assistant', greeting))
+        asyncio.create_task(self._log_event('ai_response', greeting))
+        
+        # Fire off greeting generator as a background task
+        async def greeting_gen():
+            yield greeting
+            
+        self.response_task = asyncio.create_task(
+            self._handle_ai_response(greeting_gen(), greeting)
+        )
 
     async def _handle_media(self, data):
         """Forward incoming Twilio audio to Deepgram for transcription."""
@@ -138,7 +162,30 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
         """Called when Twilio stops the stream (call ended)."""
         print("Call stopped by Twilio.")
         self.call_active = False
+        self._cancel_response_task()
         await self._log_event('call_ended', 'Call stopped by Twilio')
+
+    def _cancel_response_task(self):
+        """Helper to safely cancel the current AI speaking task."""
+        if self.response_task and not self.response_task.done():
+            self.response_task.cancel()
+            self.response_task = None
+        self.is_ai_speaking = False # Force clear the flag locally just in case
+        self.ai_spoken_buffer = "" # Clear echo buffer
+
+    async def _clear_twilio_buffer(self):
+        """Send a 'clear' event to instantly stop Twilio from playing queued audio."""
+        if self.call_active and self.stream_sid:
+            try:
+                clear_payload = {
+                    "event": "clear",
+                    "streamSid": self.stream_sid
+                }
+                await self.send(text_data=json.dumps(clear_payload))
+                self.is_ai_speaking = False
+                print("Sent clear to Twilio.")
+            except Exception as e:
+                print(f"Error sending clear: {e}")
 
     # ------------------------------------------------------------------
     # Deepgram STT
@@ -149,49 +196,118 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
         self.dg_connection = deepgram.listen.asyncwebsocket.v("1")
 
         async def on_message(self_dg, result, **kwargs):
-            sentence = result.channel.alternatives[0].transcript
+            # Sometimes deepgram can emit empty interim transcripts, ignore them
+            if not result.channel.alternatives:
+                return
+
+            sentence = result.channel.alternatives[0].transcript.strip()
+            
+            # Identify if this utterance is substantial enough to be considered a real interruption
+            is_substantial = len(sentence) > 3 or len(sentence.split()) >= 2
+            
+            # --- ANTI-ECHO HALLUCINATION ENGINE ---
+            # If the phone is on speakerphone, Deepgram might transcribe the AI's own voice.
+            # We compare the Deepgram transcript to what the AI is currently speaking.
+            # If it's highly similar, we drop it entirely.
+            if self.is_ai_speaking and self.ai_spoken_buffer:
+                normalized_stt = re.sub(r'[^\w\s]', '', sentence.lower())
+                normalized_ai = re.sub(r'[^\w\s]', '', self.ai_spoken_buffer.lower())
+                # If stt is inside what AI just said, or AI is inside stt, it's an echo.
+                if normalized_stt in normalized_ai or normalized_ai in normalized_stt:
+                    print(f"[Echo Dropped] Ignoring self-hearing hallucination: '{sentence}'")
+                    return
+
+            # --- INTERRUPTION HANDLING & VAD ---
+            if self.is_ai_speaking:
+                if not is_substantial:
+                    # Ignore background noise (e.g. coughs) while AI is speaking
+                    return
+                else:
+                    # It's substantial! 
+                    if not getattr(self, "interrupted", False): # Only interrupt and clear ONCE per utterance
+                        print(f"[Interrupt] User started speaking: '{sentence}'. Cancelling AI.")
+                        self.interrupted = True
+                        self._cancel_response_task()
+                        await self._clear_twilio_buffer()
+                        
+                        # Clear any existing debounce buffering so old audio doesn't prepend to the new query
+                        self.transcription_buffer = []
+                        if self.llm_debounce_task and not getattr(self.llm_debounce_task, 'done', lambda: True)():
+                            self.llm_debounce_task.cancel()
+                    
+                    # If it's an interim result, we've halted the AI. We now wait for the final transcript.
+                    if not result.is_final:
+                        return
+
+            # If it's just an interim result (and we aren't interrupting), do nothing.
+            if not result.is_final:
+                return
+                
+            # Ignore empty finals
             if not sentence:
                 return
-            if result.is_final:
-                confidence = result.channel.alternatives[0].confidence or 1.0
-                print(f"User: {sentence} (confidence: {confidence:.2f})")
-                await self._log_event('transcription', f"{sentence} [conf={confidence:.2f}]")
-                await self._save_message('user', sentence)
+                
+            confidence = result.channel.alternatives[0].confidence or 1.0
+            print(f"User (Final chunk): {sentence} (confidence: {confidence:.2f})")
+            
+            # Fire and forget logging for the chunk
+            asyncio.create_task(self._log_event('transcription_chunk', f"{sentence} [conf={confidence:.2f}]"))
+
+            self.interrupted = False  # Reset interrupt flag for the new turn
+            self.transcription_buffer.append(sentence)
+
+            # --- DEBOUNCE LOGIC ---
+            # Wait 0.4 seconds of silence (Deepgram already waited 500ms) before sending.
+            # Total pause time before AI speaks: ~0.9 seconds.
+            if getattr(self, "llm_debounce_task", None) and not self.llm_debounce_task.done():
+                self.llm_debounce_task.cancel()
+            
+            async def _process_user_buffer():
+                try:
+                    await asyncio.sleep(0.4) 
+                except asyncio.CancelledError:
+                    return # A new speech chunk arrived! Leave the buffer alone and exit.
+                    
+                full_sentence = " ".join(self.transcription_buffer).strip()
+                self.transcription_buffer = [] # Clear buffer for next turn
+                
+                if not full_sentence:
+                    return
+                    
+                print(f"User (Full Utterance): {full_sentence}")
+                asyncio.create_task(self._log_event('transcription', full_sentence))
+                asyncio.create_task(self._save_message('user', full_sentence))
 
                 # Check for end-call phrases
-                if END_CALL_PATTERN.search(sentence):
+                if END_CALL_PATTERN.search(full_sentence):
                     goodbye_msg = "Thank you for calling. Goodbye! Have a great day."
-                    await self._speak_text(goodbye_msg)
-                    await self._save_message('assistant', goodbye_msg)
-                    await self._log_event('call_ended', 'User said goodbye')
+                    asyncio.create_task(self._save_message('assistant', goodbye_msg))
+                    asyncio.create_task(self._log_event('call_ended', 'User said goodbye'))
+                    
+                    async def goodbye_gen(): yield goodbye_msg
+                    self._cancel_response_task()
+                    self.response_task = asyncio.create_task(self._handle_ai_response(goodbye_gen(), [goodbye_msg]))
                     return
 
-                # Low confidence — re-prompt
-                if confidence < LOW_CONFIDENCE_THRESHOLD:
-                    reprompt = "I didn't catch that clearly. Could you please repeat?"
-                    await self._speak_text(reprompt)
-                    await self._save_message('assistant', reprompt)
-                    await self._log_event('ai_response', f"Low confidence reprompt ({confidence:.2f})")
-                    return
+                # Normal flow: Kick off background task for LLM -> TTS stream
+                self._cancel_response_task() # Safety clear
+                self.response_task = asyncio.create_task(
+                    self._generate_and_speak(full_sentence)
+                )
 
-                # Normal flow: LLM → TTS
-                ai_response = await self._get_llm_response(sentence)
-                print(f"AI: {ai_response}")
-                await self._log_event('ai_response', ai_response)
-                await self._save_message('assistant', ai_response)
-
-                await self._speak_text(ai_response)
-                await self._log_event('tts_sent', ai_response)
+            self.llm_debounce_task = asyncio.create_task(_process_user_buffer())
 
         self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
         options = LiveOptions(
-            model="nova-2",
+            model="nova-2-phonecall", # better model for telephony
             language="en-US",
             encoding="mulaw",
             channels=1,
             sample_rate=8000,
-            interim_results=False,
+            interim_results=True, # MUST be True for interruption handling
+            endpointing=500, # 500ms of silence to trigger is_final
+            smart_format=True,
         )
 
         if not await self.dg_connection.start(options):
@@ -201,66 +317,130 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
         print("Deepgram started.")
 
     # ------------------------------------------------------------------
-    # Groq LLM
+    # Core Pipeline: LLM -> TTS
     # ------------------------------------------------------------------
 
-    async def _get_llm_response(self, user_text):
+    async def _generate_and_speak(self, user_text):
+        """Main orchestrator for a single conversation turn."""
         self.messages.append({"role": "user", "content": user_text})
+        
+        # We need a queue to pass words from Groq chunks to ElevenLabs
+        # ElevenLabs accepts an AsyncIterator[str].
+        
+        full_response_parts = []
+        
+        async def llm_stream_generator():
+            try:
+                stream = await groq_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=self.messages,
+                    temperature=0.6,
+                    max_tokens=150,
+                    stream=True
+                )
+                buffer = ""
+                async for chunk in stream:
+                    # Defensive check: if task was cancelled or call ended, yield nothing more
+                    if self.interrupted or not self.call_active:
+                        print("LLM generation interrupted inside generator.")
+                        break
+                        
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        full_response_parts.append(content)
+                        buffer += content
+                        self.ai_spoken_buffer += content # Track exactly what is going outward
+                        
+                        # Semantic Chunking: Yield to ElevenLabs only when a grammatical phrase completes
+                        if any(punct in buffer for punct in ['.', '!', '?', ':', '\n']):
+                            # Find the latest occurring terminal punctuation
+                            last_punct_idx = max(buffer.rfind(p) for p in ['.', '!', '?', ':', '\n'])
+                            chunk_to_yield = buffer[:last_punct_idx+1]
+                            buffer = buffer[last_punct_idx+1:]
+                            yield chunk_to_yield + " " # Yield complete sentence with space padding
+                            
+                # Flush remaining buffer at the end of the stream
+                if buffer.strip():
+                    yield buffer + " "
+                        
+            except asyncio.CancelledError:
+                print("LLM stream forcefully cancelled.")
+                raise
+            except Exception as e:
+                print(f"Groq stream error: {e}")
+                error_msg = "Sorry, I'm having trouble thinking."
+                full_response_parts.append(error_msg)
+                yield error_msg
+
+        # Hand off the generator to the speaker task
         try:
-            completion = await groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=self.messages,
-                temperature=0.6,
-                max_tokens=150,
-            )
-            response_text = completion.choices[0].message.content
-            self.messages.append({"role": "assistant", "content": response_text})
-            return response_text
-        except Exception as e:
-            print(f"Groq Error: {e}")
-            await self._log_event('error', f"Groq error: {e}")
-            return "I'm sorry, I'm having trouble thinking right now."
+            await self._handle_ai_response(llm_stream_generator(), full_response_parts)
+        except asyncio.CancelledError:
+            print("_generate_and_speak cancelled.")
+        finally:
+            # Once speaking finishes (or is cancelled), save what we *actually* generated
+            final_ai_text = "".join(full_response_parts).strip()
+            if final_ai_text:
+                self.messages.append({"role": "assistant", "content": final_ai_text})
+                print(f"AI: {final_ai_text}")
+                asyncio.create_task(self._log_event('ai_response', final_ai_text))
+                asyncio.create_task(self._save_message('assistant', final_ai_text))
 
-    # ------------------------------------------------------------------
-    # ElevenLabs TTS (with Twilio <Say> fallback)
-    # ------------------------------------------------------------------
 
-    async def _speak_text(self, text):
+    async def _handle_ai_response(self, text_iterator, full_text_ref):
         """
-        Generate speech with ElevenLabs and stream it back to Twilio.
-        Falls back to Twilio's built-in TTS (<Say>) if ElevenLabs fails.
+        Consumes an async generator of text chunks, feeds it into ElevenLabs TTS,
+        and streams the resulting audio back to Twilio.
         """
-        if not self.stream_sid:
+        if not self.stream_sid or not self.call_active:
             return
 
-        try:
-            client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        self.is_ai_speaking = True
+        self.interrupted = False
+        
+        # We need the full text for fallback purposes
+        full_text = ""
 
-            # Generate audio — ulaw_8000 is the Twilio-compatible format
-            audio_generator = client.text_to_speech.convert(
+        try:
+            # Generate audio incrementally as text arrives — ulaw_8000 is Twilio-compatible
+            audio_generator = el_client.text_to_speech.convert_as_stream(
                 voice_id=ELEVENLABS_VOICE_ID,
-                text=text,
+                text=text_iterator, 
                 model_id=ELEVENLABS_MODEL,
                 output_format="ulaw_8000",
+                optimize_streaming_latency=3, # Critical parameter for 10/10 responsiveness
             )
 
-            # ElevenLabs returns a generator of audio chunks
-            audio_bytes = b""
-            for chunk in audio_generator:
-                audio_bytes += chunk
+            CHUNK_SIZE = 4000  # Send ~0.5s chunks to minimise latency and buffer build-up
+            audio_buffer = b""
 
-            if not audio_bytes:
-                raise ValueError("ElevenLabs returned empty audio")
-
-            # Send to Twilio as base64 in chunks
-            # Twilio requires "track": "outbound" for bidirectional streams
-            # to play audio to the caller (without it, caller hears silence)
-            CHUNK_SIZE = 8000  # ~1 second of mulaw audio at 8kHz
-
-            for i in range(0, len(audio_bytes), CHUNK_SIZE):
-                chunk = audio_bytes[i:i + CHUNK_SIZE]
-                b64_audio = base64.b64encode(chunk).decode('utf-8')
-
+            async for chunk in audio_generator:
+                if self.interrupted or not self.call_active:
+                    print("TTS playback interrupted midway.")
+                    break
+                    
+                audio_buffer += chunk
+                
+                # Send to Twilio in small pieces as they arrive
+                while len(audio_buffer) >= CHUNK_SIZE:
+                    send_chunk = audio_buffer[:CHUNK_SIZE]
+                    audio_buffer = audio_buffer[CHUNK_SIZE:]
+                    
+                    b64_audio = base64.b64encode(send_chunk).decode('utf-8')
+                    media_payload = {
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {
+                            "payload": b64_audio,
+                            "track": "outbound"
+                        }
+                    }
+                    if not self.interrupted and self.call_active:
+                        await self.send(text_data=json.dumps(media_payload))
+            
+            # Flush any remaining audio in the buffer
+            if audio_buffer and not self.interrupted and self.call_active:
+                b64_audio = base64.b64encode(audio_buffer).decode('utf-8')
                 media_payload = {
                     "event": "media",
                     "streamSid": self.stream_sid,
@@ -270,25 +450,48 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
                     }
                 }
                 await self.send(text_data=json.dumps(media_payload))
-
-        except Exception as e:
-            print(f"ElevenLabs Error: {e} — falling back to Twilio TTS")
-            await self._log_event('error', f"ElevenLabs error: {e}, using Twilio TTS fallback")
-
-            # Fallback: send a clear event so Twilio knows to stop waiting,
-            # then use mark event. The actual TTS fallback via <Say> is limited
-            # in bi-directional streams, so we log the failure for debugging.
-            # In production, you'd want a secondary TTS provider here.
-            try:
-                # Send a silence/mark so the stream doesn't hang
+                
+            # Send a mark event so we know when audio has finished playing on the phone
+            if not self.interrupted and self.call_active:
                 mark_payload = {
                     "event": "mark",
                     "streamSid": self.stream_sid,
-                    "mark": {"name": "tts_fallback"}
+                    "mark": {"name": "ai_finished_speaking"}
                 }
                 await self.send(text_data=json.dumps(mark_payload))
-            except Exception as fallback_err:
-                print(f"Fallback also failed: {fallback_err}")
+
+        except asyncio.CancelledError:
+            print("_handle_ai_response task cancelled.")
+            raise
+        except Exception as e:
+            print(f"ElevenLabs TTS Error: {e}")
+            await self._log_event('error', f"ElevenLabs error. Initiating Twilio Fallback. Error: {e}")
+            
+            # Fallback to Twilio's standard <Say> voice if ElevenLabs fails
+            full_text = "".join(full_text_ref).strip()
+            if full_text and self.call_active and self.call_sid:
+                try:
+                    from twilio.rest import Client
+                    client = Client(os.environ['TWILIO_ACCOUNT_SID'], os.environ['TWILIO_AUTH_TOKEN'])
+                    
+                    # We can't send TwiML over the media socket, so we modify the live call
+                    # We use <Say> and then <Connect><Stream> to rejoin the websocket
+                    domain = os.environ.get('DOMAIN')
+                    fallback_twiml = f'''
+                    <Response>
+                        <Say voice="Polly.Joanna-Neural">{full_text}</Say>
+                        <Connect>
+                            <Stream url="wss://{domain}/ws/media/" />
+                        </Connect>
+                    </Response>
+                    '''
+                    await sync_to_async(client.calls)(self.call_sid).update(twiml=fallback_twiml)
+                    print("Successfully injected Twilio <Say> fallback.")
+                except Exception as fallback_err:
+                    print(f"Twilio fallback also failed: {fallback_err}")
+            
+        finally:
+            self.is_ai_speaking = False
 
     # ------------------------------------------------------------------
     # External Context API
@@ -377,3 +580,5 @@ class TwilioMediaConsumer(AsyncWebsocketConsumer):
             await sync_to_async(self.session.save)()
         except Exception as e:
             print(f"Error updating session: {e}")
+
+

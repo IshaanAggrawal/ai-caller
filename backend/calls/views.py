@@ -822,13 +822,89 @@ def voice_call_page(request):
 let callActive = false;
 let recognition = null;
 let sessionId = 'voice-' + Date.now();
-let currentAudio = null;
+
+let ws = null;
 let isProcessing = false;
+
+// AudioContext for smooth chunk playback
+let audioCtx = null;
+let audioQueue = [];
+let isPlaying = false;
+let startTime = 0;
 
 const callBtn = document.getElementById('callBtn');
 const statusEl = document.getElementById('status');
 const transcript = document.getElementById('transcript');
 const bars = document.querySelectorAll('.visualizer .bar');
+
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+}
+
+// Playbacks the decoded audio buffer
+function playNextBuffer() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    
+    // If the queue is empty, AI finished speaking, resume listening
+    if (callActive) {
+      isProcessing = false;
+      setStatus('Listening...', 'listening');
+      bars.forEach(b => b.style.background = '#22c55e');
+      startListening();
+    }
+    return;
+  }
+  
+  isPlaying = true;
+  const audioBuffer = audioQueue.shift();
+  const source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioCtx.destination);
+  
+  // To ensure seamless playback between chunks
+  if (startTime < audioCtx.currentTime) {
+      startTime = audioCtx.currentTime;
+  }
+  
+  source.start(startTime);
+  startTime += audioBuffer.duration;
+  
+  source.onended = () => {
+     // Check if we need to schedule next
+     if (audioCtx.currentTime >= startTime) {
+         playNextBuffer();
+     } else {
+         // The next buffer is already scheduled to play
+         setTimeout(playNextBuffer, (startTime - audioCtx.currentTime) * 1000);
+     }
+  };
+}
+
+// Converts base64 to ArrayBuffer and decodes it
+async function queueAudioChunk(base64Audio) {
+  try {
+    const binaryString = window.atob(base64Audio);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    // Decode MP3 bytes to raw AudioBuffer
+    const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+    audioQueue.push(audioBuffer);
+    
+    if (!isPlaying) {
+        startTime = audioCtx.currentTime;
+        playNextBuffer();
+    }
+  } catch (e) {
+    console.error("Audio decode error:", e);
+  }
+}
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -882,15 +958,52 @@ function startCall() {
   callBtn.className = 'call-btn active';
   callBtn.textContent = '📵';
   sessionId = 'voice-' + Date.now();
+  
+  initAudio();
+  if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+  }
 
-  setStatus('Call started — listening...', 'listening');
+  setStatus('Call started — connecting...', 'listening');
   addMsg('ai', 'Call connected. Go ahead, I\\'m listening...', 'System');
 
   barInterval = setInterval(() => {
     if (callActive) animateBars(true);
   }, 150);
 
-  startListening();
+  // Initialize WebSocket connection to WebTestConsumer
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${window.location.host}/web-stream`);
+  
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+        event: 'start',
+        system_prompt: document.getElementById('sysPrompt').value
+    }));
+    startListening();
+  };
+  
+  ws.onmessage = (async (e) => {
+    const data = JSON.parse(e.data);
+    if (data.event === 'text_chunk') {
+      setStatus('AI is speaking...', 'speaking');
+      bars.forEach(b => b.style.background = '#3b82f6');
+      addMsg('ai', data.text, 'Streaming chunk...');
+    } else if (data.event === 'audio_chunk') {
+      await queueAudioChunk(data.audio);
+    } else if (data.event === 'clear') {
+      // User interrupted!
+      audioQueue = [];
+      isPlaying = false;
+      startTime = audioCtx ? audioCtx.currentTime : 0;
+    } else if (data.event === 'error') {
+      setStatus('Error: ' + data.message, 'error');
+    }
+  });
+  
+  ws.onclose = () => {
+      if (callActive) endCall();
+  };
 }
 
 function endCall() {
@@ -902,10 +1015,17 @@ function endCall() {
     recognition.abort();
     recognition = null;
   }
-  if (currentAudio) {
-    currentAudio.pause();
-    currentAudio = null;
+  if (ws) {
+      ws.close();
+      ws = null;
   }
+  
+  audioQueue = [];
+  isPlaying = false;
+  if (audioCtx) {
+     startTime = audioCtx.currentTime;
+  }
+  
   clearInterval(barInterval);
   animateBars(false);
 
@@ -932,91 +1052,15 @@ function startListening() {
     setStatus('You said: ' + text, '');
     addMsg('user', text, (confidence * 100).toFixed(0) + '% confidence');
 
-    // Process through AI
+    // Process through WebSocket
     isProcessing = true;
     setStatus('AI is thinking...', 'thinking');
 
-    const start = Date.now();
-    try {
-      const sysPrompt = document.getElementById('sysPrompt').value;
-      const res = await fetch('/calls/test-voice/', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          message: text,
-          session_id: sessionId,
-          system_prompt: sysPrompt
-        })
-      });
-      const data = await res.json();
-      const latency = Date.now() - start;
-
-      if (data.error) {
-        setStatus('Error: ' + data.error, 'error');
-        addMsg('ai', 'Error: ' + data.error);
-        isProcessing = false;
-        if (callActive) setTimeout(startListening, 1000);
-        return;
-      }
-
-      addMsg('ai', data.response, latency + 'ms' + (data.tts_error ? ' | TTS: ' + data.tts_error : ''));
-
-      if (data.audio) {
-        setStatus('AI is speaking...', 'speaking');
-        bars.forEach(b => b.style.background = '#3b82f6');
-
-        currentAudio = new Audio('data:audio/mp3;base64,' + data.audio);
-        currentAudio.onended = () => {
-          isProcessing = false;
-          if (callActive) {
-            setStatus('Listening...', 'listening');
-            bars.forEach(b => b.style.background = '#22c55e');
-            startListening();
-          }
-        };
-        currentAudio.onerror = () => {
-          isProcessing = false;
-          if (callActive) {
-            setStatus('Listening...', 'listening');
-            startListening();
-          }
-        };
-        currentAudio.play().catch(() => {
-          isProcessing = false;
-          if (callActive) startListening();
-        });
-      } else {
-        // No audio (ElevenLabs failed) — use browser TTS as fallback
-        setStatus('AI is speaking (browser voice)...', 'speaking');
-        bars.forEach(b => b.style.background = '#3b82f6');
-
-        if ('speechSynthesis' in window) {
-          const utter = new SpeechSynthesisUtterance(data.response);
-          utter.lang = document.getElementById('lang').value;
-          utter.rate = 1.0;
-          utter.onend = () => {
-            isProcessing = false;
-            if (callActive) {
-              setStatus('Listening...', 'listening');
-              bars.forEach(b => b.style.background = '#22c55e');
-              startListening();
-            }
-          };
-          utter.onerror = () => {
-            isProcessing = false;
-            if (callActive) startListening();
-          };
-          speechSynthesis.speak(utter);
-        } else {
-          isProcessing = false;
-          if (callActive) setTimeout(startListening, 500);
-        }
-      }
-    } catch (err) {
-      setStatus('Network error', 'error');
-      addMsg('ai', 'Network error: ' + err.message);
-      isProcessing = false;
-      if (callActive) setTimeout(startListening, 2000);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        // Send to Django backend
+        ws.send(JSON.stringify({ event: 'user_text', text: text }));
+    } else {
+        setStatus('WebSocket disconnected', 'error');
     }
   };
 
